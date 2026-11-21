@@ -1,0 +1,194 @@
+# NOTE: This workflow triggers on merged PRs with posting labels.
+# It requires LinkedIn secrets (LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET,
+# LINKEDIN_ACCESS_TOKEN) and will not publish without them.
+# In a template/public repo this is harmless — it exits early when
+# the PR has no posting label. Configure secrets in repo Settings →
+# Secrets before using the approve-post / post-tomorrow / post-monday labels.
+name: Publish Approved
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: linkedin-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.merged == true
+      && (
+        contains(github.event.pull_request.labels.*.name, 'approve-post')
+        || contains(github.event.pull_request.labels.*.name, 'post-tomorrow')
+        || contains(github.event.pull_request.labels.*.name, 'post-monday')
+      )
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Restore state from state branch
+        run: |
+          if git fetch origin state 2>/dev/null; then
+            git checkout origin/state -- data/ 2>/dev/null || true
+            echo "State restored from state branch"
+          else
+            echo "No state branch yet, using main's state files"
+          fi
+
+      - name: Bootstrap state if missing
+        run: |
+          mkdir -p data
+          [ -f data/seen.json ]              || echo '[]'  > data/seen.json
+          [ -f data/published.json ]         || echo '[]'  > data/published.json
+          [ -f data/features.json ]          || echo '{}'  > data/features.json
+          [ -f data/known_repos.json ]       || echo '[]'  > data/known_repos.json
+          [ -f data/token_refreshed_at.txt ] || touch data/token_refreshed_at.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Detect posting action
+        id: action
+        run: |
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          APPROVE=$(echo "$LABELS" | jq -r 'map(select(. == "approve-post")) | length')
+          TOMORROW=$(echo "$LABELS" | jq -r 'map(select(. == "post-tomorrow")) | length')
+          MONDAY=$(echo "$LABELS" | jq -r 'map(select(. == "post-monday")) | length')
+
+          TOTAL=$((APPROVE + TOMORROW + MONDAY))
+          if [ "$TOTAL" -gt 1 ]; then
+            echo "ERROR: Multiple posting labels found. Use only one."
+            exit 1
+          fi
+
+          if [ "$APPROVE" -gt 0 ]; then
+            echo "action=publish-now" >> $GITHUB_OUTPUT
+          elif [ "$TOMORROW" -gt 0 ]; then
+            echo "action=queue" >> $GITHUB_OUTPUT
+            echo "label=post-tomorrow" >> $GITHUB_OUTPUT
+          elif [ "$MONDAY" -gt 0 ]; then
+            echo "action=queue" >> $GITHUB_OUTPUT
+            echo "label=post-monday" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify only draft files changed
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # Use GitHub API for reliable file list (not git diff which uses merged code)
+          CHANGED=$(gh api repos/$REPOSITORY/pulls/$PR_NUM/files --paginate --jq '.[].filename')
+          NON_DRAFT=$(echo "$CHANGED" | grep -vE '^drafts/.+\.md$' | grep -v '^$' || true)
+          if [ -n "$NON_DRAFT" ]; then
+            echo "::error::BLOCKED: Non-draft files changed in PR #$PR_NUM: $NON_DRAFT"
+            echo "safe=false" >> $GITHUB_OUTPUT
+            gh issue create \
+              --title "Security: publish blocked for PR #$PR_NUM" \
+              --body "PR #$PR_NUM was merged with approve-post label but contained non-draft file changes. Publishing was blocked as a security precaution.\n\nChanged files:\n$NON_DRAFT" \
+              --label "bug" \
+              --assignee "$REPO_OWNER" || true
+          else
+            echo "Only draft files changed. Safe to publish."
+            echo "safe=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Queue for scheduled publishing
+        if: steps.action.outputs.action == 'queue' && steps.verify.outputs.safe == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          LABEL: ${{ steps.action.outputs.label }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # Find draft files from this PR
+          DRAFTS=$(gh api repos/$REPOSITORY/pulls/$PR_NUM/files --jq '.[].filename | select(startswith("drafts/"))')
+
+          for DRAFT in $DRAFTS; do
+            DRAFT_ID=$(basename "$DRAFT" .md)
+            python -c "
+          from src.publish_queue import queue_post
+          queue_post('$DRAFT_ID', '$DRAFT', $PR_NUM, '$LABEL')
+          print(f'Queued {\"$DRAFT_ID\"} with label {\"$LABEL\"}')
+          "
+          done
+
+      - name: Publish approved drafts
+        if: steps.action.outputs.action == 'publish-now' && steps.verify.outputs.safe == 'true'
+        id: publish
+        env:
+          LINKEDIN_CLIENT_ID: ${{ secrets.LINKEDIN_CLIENT_ID }}
+          LINKEDIN_CLIENT_SECRET: ${{ secrets.LINKEDIN_CLIENT_SECRET }}
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+        run: |
+          OUTPUT=$(python main.py publish 2>&1)
+          echo "$OUTPUT"
+          # Extract publish count
+          PUBLISHED=$(echo "$OUTPUT" | grep -oP 'Published \K\d+')
+          echo "published_count=${PUBLISHED:-0}" >> $GITHUB_OUTPUT
+
+      - name: Push state to state branch
+        if: steps.verify.outputs.safe == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && exit 0
+
+          git commit -m "state: update published $(date -u +%Y-%m-%d)"
+
+          # Push to unprotected state branch (bypasses main's ruleset)
+          for i in 1 2 3; do
+            if git push origin HEAD:refs/heads/state --force 2>/dev/null; then
+              echo "State pushed to state branch on attempt $i"
+              exit 0
+            fi
+            echo "State push failed (attempt $i), retrying..."
+            sleep 2
+          done
+          echo "::warning::State push failed after 3 attempts"
+
+      - name: Alert on publish failure
+        if: steps.publish.outputs.published_count == '0' || failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          REASON="unknown"
+          if [ "$PUBLISH_OUTCOME" = "failure" ]; then
+            REASON="Publish step failed (check logs)"
+          else
+            REASON="0 posts published (token may be expired or draft not found)"
+          fi
+
+          BODY="PR #${PR_NUM} was merged with approve-post label but **no post was published to LinkedIn**."$'\n\n'"**Reason:** $REASON"$'\n\n'"**Action required:**"$'\n'"1. Check the [workflow run logs](${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID})"$'\n'"2. If token expired: re-run \`scripts/linkedin_setup.py\` and update \`LINKEDIN_ACCESS_TOKEN\` secret"$'\n'"3. To retry: run \`python main.py publish\` locally with valid credentials"
+          gh issue create \
+            --title "Publish failed: $PR_TITLE" \
+            --body "$BODY" \
+            --label "bug" \
+            --assignee "$REPO_OWNER"

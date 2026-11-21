@@ -1,0 +1,90 @@
+# LinkedIn Auto-Poster Configuration
+# Copy this file to config.yaml and customize for your use case.
+#
+# This file is validated by the Pydantic model in src/feeds/__init__.py.
+# All sections below map to the AppConfig schema.
+
+# --- Author ---
+# Your name as it appears on LinkedIn. Used in AI prompts so posts sound like you.
+# Can also be set via the AUTHOR_NAME environment variable.
+author_name: "Your Name"
+
+# --- News Sources ---
+# RSS/Atom feeds to monitor. Each entry needs a display name and feed URL.
+# Customize these for your industry (Azure feeds shown as example).
+feeds:
+  - name: "Azure Updates"         # Display name shown in logs
+    url: "https://azurecomcdn.azureedge.net/en-us/updates/feed/"
+  - name: "Azure Blog"
+    url: "https://azure.microsoft.com/en-us/blog/feed/"
+  - name: "Kubernetes Blog"
+    url: "https://kubernetes.io/feed.xml"
+  # Add more feeds here...
+
+# --- Filtering & Scoring ---
+# Controls which news items are selected and how they are ranked.
+# See README.md "How Scoring Works" for the full algorithm.
+filter:
+  # Items must match at least one include keyword to be considered.
+  include_keywords:
+    - "Kubernetes"
+    - "AKS"
+    - "Terraform"
+    - "Landing Zone"
+    - "Bicep"
+    - "AI Foundry"
+    - "Copilot"
+    - "Defender"
+    - "infrastructure"
+  # Items matching any exclude keyword are dropped immediately.
+  exclude_keywords:
+    - "Entra"
+    - "Active Directory"
+    - "Microsoft 365"
+    - "Teams"
+    - "Intune"
+  # Minimum score to keep an item (lower = more items). Default: 3.
+  min_significance_score: 3
+  # Maximum drafts per run (prevents flooding). Default: 5.
+  max_posts_per_run: 5
+  # Score threshold for standalone posts. Items below this go into roundups.
+  # Raise this if you get too many standalone posts. Default: 12.
+  standalone_threshold: 12
+
+# --- LLM Configuration ---
+# Which AI backend writes the drafts:
+#   auto      - Claude API if ANTHROPIC_API_KEY is set, otherwise GitHub Copilot SDK (default)
+#   anthropic - Claude API via the Anthropic SDK (needs ANTHROPIC_API_KEY)
+#   copilot   - GitHub Copilot SDK (needs a Copilot subscription + COPILOT_GITHUB_TOKEN)
+# The AI_PROVIDER environment variable overrides this.
+llm:
+  provider: "auto"
+  # Optional model overrides (ids are provider-specific). Leave unset for defaults:
+  #   anthropic: claude-opus-5-5 for drafting and critique
+  #   copilot:   claude-opus-4.6 for drafting, gpt-5.4 for critique
+  # draft_model: "claude-opus-5-5"
+  # critic_model: "claude-opus-5-5"
+  model: "gpt-4o"           # Legacy field, unused by the pipeline
+  temperature: 0.7          # Legacy field, unused by the Claude API backend
+  max_tokens: 500           # Legacy field, unused by the pipeline
+
+# --- LinkedIn ---
+# LinkedIn post settings. These have sensible defaults.
+linkedin:
+  visibility: "PUBLIC"      # Post visibility: PUBLIC or CONNECTIONS
+  max_post_length: 1500     # Hard character limit for LinkedIn posts
+
+# --- Publishing ---
+# Controls for the publish command.
+publish:
+  max_age_days: 7           # Skip drafts older than this many days
+  dry_run: false            # Set to true to preview without posting
+
+# --- GitHub Releases (optional) ---
+# Monitor specific repos for new releases. Not part of the Pydantic model;
+# read directly from the raw YAML in the fetch command.
+github_releases:
+  - repo: "hashicorp/terraform-provider-azurerm"
+    name: "AzureRM Terraform Provider"
+    min_release_type: "minor"  # minor | major | patch
+  # Add more repos here...
